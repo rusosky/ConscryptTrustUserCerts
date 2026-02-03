@@ -1,73 +1,91 @@
-#!/system/bin/sh
+# Script copy from http toolkit code.
+# https://httptoolkit.com/blog/android-14-install-system-ca-certificate/
+# https://github.com/httptoolkit/httptoolkit-server/commit/965fd8d9b287af0e4b305d828d5e8e1aa52dce36
+set -e # Fail on error
 
-# Wait for boot to complete
-while [ "$(getprop sys.boot_completed)" != 1 ]; do
-    /system/bin/sleep 1s
-done
+echo "\n---\nInjecting certificate:"
 
-/system/bin/echo "[$(date +%F) $(date +%T)] - Boot Completed" > /data/local/tmp/conscrypt-trustusercerts-log.txt
+# Create a separate temp directory to hold the current certificates
+# Without this, when we add the mount, we can't read the current certs anymore.
+mkdir -p /data/local/tmp/htk-ca-copy
+chmod 700 /data/local/tmp/htk-ca-copy
+rm -rf /data/local/tmp/htk-ca-copy/*
 
-# Create a separate temp directory, to hold the current certificates
-# Otherwise, when we add the mount we can't read the current certs anymore.
-
-mkdir -p -m 700 /data/local/tmp/tmp-ca-copy
-
-# Copy out the existing certificates and the user ones
-cp /apex/com.android.conscrypt/cacerts/* /data/local/tmp/tmp-ca-copy/
-
-cp /data/misc/user/0/cacerts-added/* /data/local/tmp/tmp-ca-copy/
+# Copy out the existing certificates
+if [ -d "/apex/com.android.conscrypt/cacerts" ]; then
+    cp /apex/com.android.conscrypt/cacerts/* /data/local/tmp/htk-ca-copy/
+else
+    cp /system/etc/security/cacerts/* /data/local/tmp/htk-ca-copy/
+fi
 
 # Create the in-memory mount on top of the system certs folder
 mount -t tmpfs tmpfs /system/etc/security/cacerts
 
-# Copy the existing certs back into the tmpfs, so we keep trusting them
-mv /data/local/tmp/tmp-ca-copy/* /system/etc/security/cacerts/
+# Copy the existing certs back into the tmpfs mount, so we keep trusting them
+mv /data/local/tmp/htk-ca-copy/* /system/etc/security/cacerts/
 
-# Update the perms & selinux context labels
-set_perm_recursive /system/etc/security/cacerts root root 644 644 u:object_r:system_file:s0
+# Copy our new cert in, so we trust that too
+cp /data/misc/user/0/cacerts-added/* /system/etc/security/cacerts/
 
-/system/bin/echo "[$(date +%F) $(date +%T)] - TempFS Created & certs added" >> /data/local/tmp/conscrypt-trustusercerts-log.txt
+# Update the perms & selinux context labels, so everything is as readable as before
+chown root:root /system/etc/security/cacerts/*
+chmod 644 /system/etc/security/cacerts/*
 
-# Deal with the APEX overrides, which need injecting into each namespace:
+chcon u:object_r:system_file:s0 /system/etc/security/cacerts/
+chcon u:object_r:system_file:s0 /system/etc/security/cacerts/*
 
-# First we get the Zygote process(es), which launch each app
-ZYGOTE_PID=$(pidof zygote || true)
-ZYGOTE64_PID=$(pidof zygote64 || true)
-# N.b. some devices appear to have both!
+echo 'System cacerts setup completed'
 
-# Apps inherit the Zygote's mounts at startup, so we inject here to ensure
-# all newly started apps will see these certs straight away:
-for Z_PID in $ZYGOTE_PID; do
-    if [ -n "$Z_PID" ]; then
-        /system/bin/nsenter --mount=/proc/$Z_PID/ns/mnt -- /bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
-        /system/bin/echo "[$(date +%F) $(date +%T)] - Mounted successfully on Zygote - PID: $Z_PID" >> /data/local/tmp/conscrypt-trustusercerts-log.txt
-    fi
-done
+# Deal with the APEX overrides in Android 14+, which need injecting into each namespace:
+if [ -d "/apex/com.android.conscrypt/cacerts" ]; then
+    echo 'Injecting certificates into APEX cacerts'
 
-for Z_PID in $ZYGOTE64_PID; do
-    if [ -n "$Z_PID" ]; then
-        /system/bin/nsenter --mount=/proc/$Z_PID/ns/mnt -- /bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
-        /system/bin/echo "[$(date +%F) $(date +%T)] - Mounted successfully on Zygote - PID: $Z_PID" >> /data/local/tmp/conscrypt-trustusercerts-log.txt
-    fi
-done
+    # When the APEX manages cacerts, we need to mount them at that path too. We can't do
+    # this globally as APEX mounts are namespaced per process, so we need to inject a
+    # bind mount for this directory into every mount namespace.
 
-# Then we inject the mount into all already running apps, so they
-# too see these CA certs immediately:
+    # First we mount for the shell itself, for completeness and so we can see this
+    # when we check for correct installation on later runs
+    mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
 
-# Get the PID of every process whose parent is one of the Zygotes:
-APP_PIDS=$(
-    echo "$ZYGOTE_PID $ZYGOTE64_PID" | \
-    xargs -n1 ps -o 'PID' -P | \
-    grep -v PID
-)
-# Inject into the mount namespace of each of those apps:
-for PID in $APP_PIDS; do
-    /system/bin/nsenter --mount=/proc/$PID/ns/mnt -- /bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts &
-done
-wait # Launched in parallel - wait for completion here
-/system/bin/echo "[$(date +%F) $(date +%T)] - Mounted successfully on running processes" >> /data/local/tmp/conscrypt-trustusercerts-log.txt
+    # First we get the Zygote process(es), which launch each app
+    ZYGOTE_PID=$(pidof zygote || true)
+    ZYGOTE64_PID=$(pidof zygote64 || true)
+    Z_PIDS="$ZYGOTE_PID $ZYGOTE64_PID"
+    # N.b. some devices appear to have both, some have >1 of each (!)
 
+    # Apps inherit the Zygote's mounts at startup, so we inject here to ensure all newly
+    # started apps will see these certs straight away:
+    for Z_PID in $Z_PIDS; do
+	if [ -n "$Z_PID" ]; then
+	    nsenter --mount=/proc/$Z_PID/ns/mnt -- \
+		/bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
+	fi
+    done
 
-# Remove the temporary cert folder
-rm -rf /data/local/tmp/tmp-ca-copy
-/system/bin/echo "[$(date +%F) $(date +%T)] - Enjoy the HTTPS interception :D" >> /data/local/tmp/conscrypt-trustusercerts-log.txt
+    echo 'Zygote APEX certificates remounted'
+
+    # Then we inject the mount into all already running apps, so they see these certs immediately.
+
+    # Get the PID of every process whose parent is one of the Zygotes:
+    APP_PIDS=$(
+	echo $Z_PIDS | \
+	xargs -n1 ps -o 'PID' -P | \
+	grep -v PID
+    )
+
+    # Inject into the mount namespace of each of those apps:
+    for PID in $APP_PIDS; do
+	nsenter --mount=/proc/$PID/ns/mnt -- \
+	    /bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts &
+    done
+    wait # Launched in parallel - wait for completion here
+
+    echo "APEX certificates remounted for $(echo $APP_PIDS | wc -w) apps"
+fi
+
+# Delete the temp cert directory & this script itself
+rm -r /data/local/tmp/htk-ca-copy
+# rm ${injectionScriptPath}
+
+echo "System cert successfully injected\n---\n"
